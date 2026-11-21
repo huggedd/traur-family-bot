@@ -385,6 +385,38 @@ def grant_points_unlimited(guild_id, user_id, reviewer_id, amount, reason):
         conn.close()
 
 
+def bulk_grant_target_count(guild_id):
+    """Number of registered players who will receive an owner bulk grant."""
+    with connect() as conn:
+        return conn.execute(
+            'SELECT COUNT(*) FROM players WHERE guild_id=?',(guild_id,)).fetchone()[0]
+
+
+def grant_points_all_unlimited(guild_id, reviewer_id, amount, reason):
+    """Grant every registered player points without affecting the weekly cap."""
+    if amount <= 0 or amount > 1000000:
+        return 'invalid', []
+    conn = connect()
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        players=conn.execute(
+            'SELECT user_id,personal_channel_id FROM players WHERE guild_id=? ORDER BY user_id',
+            (guild_id,)).fetchall()
+        if not players:
+            conn.rollback()
+            return 'empty', []
+        conn.executemany('''INSERT INTO point_transactions(
+            guild_id,user_id,amount,kind,description,reviewer_id,week_key)
+            VALUES(?,?,?,?,?,?,NULL)''',(
+                (guild_id,row['user_id'],amount,'owner_grant_all',reason,reviewer_id)
+                for row in players
+            ))
+        conn.commit()
+        return 'ok', [(row['user_id'],row['personal_channel_id']) for row in players]
+    finally:
+        conn.close()
+
+
 def set_shop_item(guild_id, name, price, description):
     with connect() as conn:
         conn.execute('''INSERT INTO shop_items(guild_id,name,description,price,active)

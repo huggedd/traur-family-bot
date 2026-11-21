@@ -209,6 +209,95 @@ class AdminMemberSelectView(discord.ui.View):
         self.add_item(AdminUserSelect())
 
 
+class BulkGrantConfirmView(discord.ui.View):
+    def __init__(self,owner_id,amount,reason):
+        super().__init__(timeout=120)
+        self.owner_id=owner_id
+        self.amount=amount
+        self.reason=reason
+        self.used=False
+
+    async def interaction_check(self,interaction:discord.Interaction):
+        if interaction.user.id!=self.owner_id or not is_owner(interaction.user):
+            await interaction.response.send_message(
+                'Подтвердить массовую выдачу может только Owner, который её создал.',ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label='Подтвердить выдачу всем',style=discord.ButtonStyle.danger,
+                       emoji='✅')
+    async def confirm(self,interaction:discord.Interaction,button:discord.ui.Button):
+        if self.used:
+            return await interaction.response.send_message('Эта выдача уже обработана.',ephemeral=True)
+        self.used=True
+        for item in self.children:
+            item.disabled=True
+        await interaction.response.defer(ephemeral=True,thinking=True)
+        status,players=db.grant_points_all_unlimited(
+            interaction.guild_id,interaction.user.id,self.amount,self.reason)
+        if status!='ok':
+            message=('В семье пока нет зарегистрированных профилей.' if status=='empty'
+                     else 'Введите число от 1 до 1 000 000.')
+            return await interaction.edit_original_response(content=message,view=None)
+        notified=0
+        notification=discord.Embed(
+            title='MCL | Общее начисление',
+            description=(f'Начислено: **+{self.amount} TP**\n'
+                         f'Причина: **{self.reason}**\n'
+                         f'Выдал: {interaction.user.mention}\n\n'
+                         'Начисление не влияет на недельный лимит.'),
+            color=discord.Color.green())
+        for user_id,channel_id in players:
+            channel=interaction.guild.get_channel(channel_id) if channel_id else None
+            if not isinstance(channel,discord.TextChannel):
+                continue
+            try:
+                await channel.send(content=f'<@{user_id}>',embed=notification)
+                notified+=1
+            except discord.HTTPException:
+                logging.exception('Could not send bulk owner grant notification')
+        count=len(players)
+        await interaction.edit_original_response(
+            content=(f'✅ Всем зарегистрированным игрокам (**{count}**) выдано '
+                     f'по **{self.amount} TP**. Всего начислено: **{count*self.amount} TP**. '
+                     f'Уведомления доставлены: **{notified}/{count}**.'),view=None)
+        self.stop()
+
+    @discord.ui.button(label='Отмена',style=discord.ButtonStyle.secondary,emoji='✖️')
+    async def cancel(self,interaction:discord.Interaction,button:discord.ui.Button):
+        self.used=True
+        await interaction.response.edit_message(content='Массовая выдача отменена.',view=None)
+        self.stop()
+
+
+class BulkGrantModal(discord.ui.Modal,title='MCL | Выдать баллы всей семье'):
+    amount=discord.ui.TextInput(label='Баллов каждому',placeholder='Например: 20',
+                                min_length=1,max_length=7)
+    reason=discord.ui.TextInput(label='Причина',style=discord.TextStyle.paragraph,
+                                placeholder='Еженедельная награда всей семье',
+                                min_length=3,max_length=250)
+
+    async def on_submit(self,interaction:discord.Interaction):
+        if not is_owner(interaction.user):
+            return await interaction.response.send_message('Только Owner / администратор.',ephemeral=True)
+        try:
+            amount=int(str(self.amount).strip())
+        except ValueError:
+            return await interaction.response.send_message('Введи целое число.',ephemeral=True)
+        if amount<=0 or amount>1000000:
+            return await interaction.response.send_message(
+                'Введите число от 1 до 1 000 000.',ephemeral=True)
+        reason=str(self.reason).strip()
+        count=db.bulk_grant_target_count(interaction.guild_id)
+        if count==0:
+            return await interaction.response.send_message(
+                'В семье пока нет зарегистрированных профилей.',ephemeral=True)
+        await interaction.response.send_message(
+            f'⚠️ Выдать **{count}** игрокам по **{amount} TP**? '
+            f'Всего будет начислено **{count*amount} TP**.\nПричина: **{reason}**',
+            view=BulkGrantConfirmView(interaction.user.id,amount,reason),ephemeral=True)
+
+
 class PanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -248,6 +337,13 @@ class PanelView(discord.ui.View):
         await interaction.response.send_message(
             'Выбери игрока. Начисление увеличит баланс без недельного лимита.',
             view=AdminMemberSelectView(),ephemeral=True)
+
+    @discord.ui.button(label='Админ: выдать всем',style=discord.ButtonStyle.danger,
+                       custom_id='mcl:admin:grant_all',row=1)
+    async def admin_grant_all(self,interaction:discord.Interaction,button:discord.ui.Button):
+        if not is_owner(interaction.user):
+            return await interaction.response.send_message('Только Owner / администратор.',ephemeral=True)
+        await interaction.response.send_modal(BulkGrantModal())
 
 
 async def open_shop(interaction):
@@ -678,6 +774,15 @@ async def admin_grant(interaction:discord.Interaction):
     await interaction.response.send_message(
         'Выбери игрока. Начисление увеличит баланс и не изменит недельный счётчик.',
         view=AdminMemberSelectView(),ephemeral=True)
+
+
+@bot.tree.command(name='admin_grant_all',description='Owner: выдать баллы всей семье вне лимита')
+@app_commands.guild_only()
+async def admin_grant_all(interaction:discord.Interaction):
+    if not is_owner(interaction.user):
+        return await interaction.response.send_message(
+            'Только Owner / администратор.',ephemeral=True)
+    await interaction.response.send_modal(BulkGrantModal())
 
 
 @bot.tree.command(name='leaderboard',description='Топ игроков MCL по баллам за неделю')

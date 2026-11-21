@@ -10,6 +10,7 @@ Same logic as v0.2: player registration, persistent private archive channel per 
 - Player profiles show weekly earned points, current spendable balance, and lifetime earned points. Purchases and manual deductions do not reduce the weekly-earned counter.
 - Shop items are intentionally stored in SQLite instead of source code, so the real catalog and prices can be entered from Discord without another deployment.
 - Owner / administrators can use the **Админ: выдать баллы** button or `/admin_grant` to grant 1–1,000,000 points per operation without changing the 160-point weekly counter. Every grant requires a reason, is stored in the transaction ledger, and is announced in the player's private channel.
+- Owner / administrators can use **Админ: выдать всем** or `/admin_grant_all` to grant the same amount to every registered player outside the weekly limit. The bot previews the recipient count and total, requires a second confirmation, logs one transaction per player, and notifies every available private channel.
 
 ## Railway deployment
 1. In Railway, stop the service before database migration if there is any live data. Never run this bot from your PC and Railway at the same time.
