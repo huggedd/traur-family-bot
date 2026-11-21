@@ -1,8 +1,24 @@
+import os
 import sqlite3
+from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-DB_PATH = 'mcl.sqlite3'
+# Railway volumes are mounted outside the deploy directory.
+# In Railway use RAILWAY_VOLUME_MOUNT_PATH=/data (managed by Railway).
+# Locally the DB stays next to database.py.
+volume_path = os.getenv('RAILWAY_VOLUME_MOUNT_PATH')
+explicit_db_path = os.getenv('MCL_DB_PATH')
+if os.getenv('RAILWAY_ENVIRONMENT_NAME') and not (volume_path or explicit_db_path):
+    raise RuntimeError(
+        'Railway Volume not found. Attach a Volume to this service before starting. '
+        'Do not store SQLite in the temporary deployment filesystem.'
+    )
+DB_PATH = str(
+    Path(explicit_db_path) if explicit_db_path else
+    (Path(volume_path) / 'mcl.sqlite3' if volume_path else
+     Path(__file__).resolve().parent / 'mcl.sqlite3')
+)
 TZ = ZoneInfo('Europe/Zagreb')
 LIMIT = 160
 
