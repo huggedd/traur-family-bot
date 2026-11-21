@@ -232,6 +232,7 @@ class MCLBot(commands.Bot):
         super().__init__(command_prefix='!',intents=intents)
 
     async def setup_hook(self):
+        logging.info("SQLite database path: %s", db.DB_PATH)
         db.init_db()
         db.init_v2()
         self.add_view(PanelView())
