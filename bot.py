@@ -26,14 +26,39 @@ def is_staff(member):
 
 
 def profile_embed(member, record):
-    total, weekly = db.points(member.guild.id, member.id)
+    balance, weekly, earned = db.point_summary(member.guild.id, member.id)
     em = discord.Embed(title='MCL | Профиль игрока', color=discord.Color.gold())
     em.add_field(name='Игровой ник',value=record['nickname'],inline=False)
     em.add_field(name='За неделю',value=f'{weekly} / {db.LIMIT}',inline=True)
-    em.add_field(name='За всё время',value=str(total),inline=True)
+    em.add_field(name='Баланс',value=str(balance),inline=True)
+    em.add_field(name='Всего заработано',value=str(earned),inline=True)
     em.add_field(name='Неделя с',value=db.week_key(),inline=False)
     em.set_footer(text='Недельный счёт обновляется автоматически по понедельникам (Europe/Zagreb)')
     return em
+
+
+def shop_embed(guild_id):
+    items = db.shop_items(guild_id)
+    lines = []
+    for item in items:
+        details = f' — {item["description"]}' if item['description'] else ''
+        lines.append(f'**{item["name"]}** — `{item["price"]}` баллов{details}')
+    description = '\n'.join(lines) if lines else 'Магазин пока не заполнен.'
+    return discord.Embed(
+        title='🛒 MCL | Магазин наград',
+        description=description[:4096],
+        color=discord.Color.gold(),
+    )
+
+
+def shop_panel_embed():
+    return discord.Embed(
+        title='🛒 MCL | Магазин наград',
+        description=('Нажми **«Открыть магазин»**, выбери товар и подтверди запрос.\n'
+                     'Запрос появится в твоём личном канале. Баллы спишутся только '
+                     'после одобрения Owner / Tier Check.'),
+        color=discord.Color.gold(),
+    )
 
 
 async def ensure_personal_channel(guild, user):
@@ -138,6 +163,89 @@ class PanelView(discord.ui.View):
             return await interaction.response.send_message('Сначала зарегистрируйся.',ephemeral=True)
         await interaction.response.send_modal(ActivityModal())
 
+    @discord.ui.button(label='Магазин',style=discord.ButtonStyle.primary,custom_id='mcl:shop:panel')
+    async def shop(self,interaction:discord.Interaction,button:discord.ui.Button):
+        await open_shop(interaction)
+
+
+async def open_shop(interaction):
+    if not db.player(interaction.guild_id,interaction.user.id):
+        return await interaction.response.send_message('Сначала зарегистрируйся.',ephemeral=True)
+    items = db.shop_items(interaction.guild_id)
+    if not items:
+        return await interaction.response.send_message('Магазин пока не заполнен.',ephemeral=True)
+    await interaction.response.send_message(
+        embed=shop_embed(interaction.guild_id),view=ShopSelectView(items),ephemeral=True)
+
+
+class ShopPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label='Открыть магазин',style=discord.ButtonStyle.primary,
+                       emoji='🛒',custom_id='mcl:shop:open')
+    async def open(self,interaction:discord.Interaction,button:discord.ui.Button):
+        await open_shop(interaction)
+
+
+class ShopSelect(discord.ui.Select):
+    def __init__(self,items):
+        options=[]
+        for item in items:
+            description = f'{item["price"]} баллов'
+            if item['description']:
+                description += f' • {item["description"]}'
+            options.append(discord.SelectOption(
+                label=item['name'][:100],value=str(item['id']),
+                description=description[:100],emoji='🎁'))
+        super().__init__(placeholder='Выбери товар…',min_values=1,max_values=1,
+                         options=options,custom_id='mcl:shop:select')
+
+    async def callback(self,interaction:discord.Interaction):
+        await interaction.response.defer(ephemeral=True,thinking=True)
+        item_id=int(self.values[0])
+        item=db.shop_item(interaction.guild_id,item_id)
+        if item is None:
+            return await interaction.followup.send('Этот товар больше недоступен.',ephemeral=True)
+        try:
+            channel=await ensure_personal_channel(interaction.guild,interaction.user)
+        except (discord.HTTPException,ValueError) as exc:
+            return await interaction.followup.send(str(exc),ephemeral=True)
+        status,request_id,balance=db.create_purchase_request(
+            interaction.guild_id,interaction.user.id,item_id)
+        if status!='ok':
+            reasons={
+                'missing':'Этот товар больше недоступен.',
+                'unregistered':'Сначала зарегистрируйся.',
+                'duplicate':f'У тебя уже есть заявка на этот товар (#{request_id}).',
+                'insufficient':f'Недостаточно баллов. Баланс: **{balance}**, цена: **{item["price"]}**.',
+            }
+            return await interaction.followup.send(reasons[status],ephemeral=True)
+        em=discord.Embed(
+            title=f'MCL | Покупка #{request_id}',
+            description=(f'Покупатель: {interaction.user.mention}\n'
+                         f'Товар: **{item["name"]}**\n'
+                         f'Цена: **{item["price"]} баллов**\n'
+                         f'Баланс до покупки: **{balance}**\n'
+                         'Статус: **Ожидает подтверждения**'),
+            color=discord.Color.orange())
+        try:
+            review=await channel.send(embed=em,view=PurchaseReviewView(request_id))
+        except discord.HTTPException:
+            db.reject_purchase(request_id,0,'Не удалось отправить запрос в личный канал.')
+            logging.exception('Could not create purchase review message')
+            return await interaction.followup.send('Не удалось отправить запрос. Попробуй позже.',ephemeral=True)
+        db.attach_purchase_request(request_id,channel.id,review.id)
+        await interaction.followup.send(
+            f'📨 Запрос на **{item["name"]}** отправлен в {channel.mention}. '
+            'Баллы спишутся после одобрения Owner / Tier Check.',ephemeral=True)
+
+
+class ShopSelectView(discord.ui.View):
+    def __init__(self,items):
+        super().__init__(timeout=300)
+        self.add_item(ShopSelect(items))
+
 
 async def finish_review(interaction,submission_id,status,details):
     s = db.submission(submission_id)
@@ -225,6 +333,88 @@ class RejectButton(discord.ui.Button):
         await interaction.response.send_modal(RejectModal(self.sid))
 
 
+async def finish_purchase_review(interaction,request_id,status,details):
+    request=db.purchase_request(request_id)
+    if request is None:
+        return
+    em=discord.Embed(
+        title=f'MCL | Покупка #{request_id}',
+        description=(f'<@{request["user_id"]}>\n'
+                     f'Товар: **{request["item_name"]}**\n'
+                     f'Цена: **{request["price"]} баллов**\n'
+                     f'**{status}**\n{details}'),
+        color=discord.Color.green() if status=='Одобрено' else discord.Color.red())
+    try:
+        channel=interaction.guild.get_channel(request['channel_id'])
+        if isinstance(channel,discord.TextChannel):
+            message=await channel.fetch_message(request['message_id'])
+            await message.edit(embed=em,view=None)
+    except discord.HTTPException:
+        logging.exception('Could not update purchase review message')
+
+
+class PurchaseApproveButton(discord.ui.Button):
+    def __init__(self,request_id):
+        super().__init__(label='Одобрить покупку',style=discord.ButtonStyle.success,
+                         custom_id=f'mcl:purchase:approve:{request_id}')
+        self.request_id=request_id
+
+    async def callback(self,interaction):
+        if not is_staff(interaction.user):
+            return await interaction.response.send_message(
+                'Только Owner / Tier Check.',ephemeral=True)
+        status,balance=db.approve_purchase(self.request_id,interaction.user.id)
+        if status!='ok':
+            reasons={
+                'closed':'Запрос уже обработан.',
+                'insufficient':f'У игрока уже недостаточно баллов. Текущий баланс: **{balance}**.',
+            }
+            return await interaction.response.send_message(reasons[status],ephemeral=True)
+        await interaction.response.send_message(
+            f'✅ Покупка одобрена. Новый баланс игрока: **{balance}**.',ephemeral=True)
+        await finish_purchase_review(
+            interaction,self.request_id,'Одобрено',f'Баллы списаны. Новый баланс: **{balance}**')
+
+
+class PurchaseRejectModal(discord.ui.Modal,title='MCL | Отклонить покупку'):
+    reason=discord.ui.TextInput(label='Причина отказа',style=discord.TextStyle.paragraph,
+                                min_length=3,max_length=250)
+
+    def __init__(self,request_id):
+        super().__init__()
+        self.request_id=request_id
+
+    async def on_submit(self,interaction:discord.Interaction):
+        if not is_staff(interaction.user):
+            return await interaction.response.send_message('Нет доступа.',ephemeral=True)
+        result=db.reject_purchase(self.request_id,interaction.user.id,str(self.reason))
+        if not result:
+            return await interaction.response.send_message('Запрос уже обработан.',ephemeral=True)
+        await interaction.response.send_message('❌ Покупка отклонена.',ephemeral=True)
+        await finish_purchase_review(
+            interaction,self.request_id,'Отклонено',str(self.reason))
+
+
+class PurchaseRejectButton(discord.ui.Button):
+    def __init__(self,request_id):
+        super().__init__(label='Отклонить',style=discord.ButtonStyle.danger,
+                         custom_id=f'mcl:purchase:reject:{request_id}')
+        self.request_id=request_id
+
+    async def callback(self,interaction):
+        if not is_staff(interaction.user):
+            return await interaction.response.send_message(
+                'Только Owner / Tier Check.',ephemeral=True)
+        await interaction.response.send_modal(PurchaseRejectModal(self.request_id))
+
+
+class PurchaseReviewView(discord.ui.View):
+    def __init__(self,request_id):
+        super().__init__(timeout=None)
+        self.add_item(PurchaseApproveButton(request_id))
+        self.add_item(PurchaseRejectButton(request_id))
+
+
 class MCLBot(commands.Bot):
     def __init__(self):
         intents=discord.Intents.default()
@@ -235,9 +425,13 @@ class MCLBot(commands.Bot):
         logging.info("SQLite database path: %s", db.DB_PATH)
         db.init_db()
         db.init_v2()
+        db.init_v3()
         self.add_view(PanelView())
+        self.add_view(ShopPanelView())
         for s in db.pending_submissions():
             self.add_view(ReviewView(s['id']),message_id=s['message_id'])
+        for request in db.pending_purchase_requests():
+            self.add_view(PurchaseReviewView(request['id']),message_id=request['message_id'])
         if GUILD_ID:
             guild=discord.Object(id=GUILD_ID)
             self.tree.copy_global_to(guild=guild)
@@ -255,7 +449,11 @@ async def setup(interaction:discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message('Команда только для администраторов.',ephemeral=True)
     em=discord.Embed(title='🏆 MCL | FAMILY POINTS',
-        description='**Регистрация:** создай игровой профиль.\n**Мой профиль:** проверь баллы.\n**Подать на баллы:** приложи скриншот/видео в личном канале.\n\n**Лимит: 160 баллов за неделю.**',
+        description=('**Регистрация:** создай игровой профиль.\n'
+                     '**Мой профиль:** проверь баланс и баллы.\n'
+                     '**Подать на баллы:** приложи скриншот/видео в личном канале.\n'
+                     '**Магазин:** выбери награду и отправь запрос на покупку.\n\n'
+                     '**Лимит: 160 баллов за неделю.**'),
         color=discord.Color.gold())
     await interaction.channel.send(embed=em,view=PanelView())
     await interaction.response.send_message('✅ Панель опубликована.',ephemeral=True)
@@ -270,14 +468,129 @@ async def profile(interaction:discord.Interaction):
     await interaction.response.send_message(embed=profile_embed(interaction.user,p),ephemeral=True)
 
 
+@bot.tree.command(name='shop',description='Открыть магазин MCL')
+@app_commands.guild_only()
+async def shop(interaction:discord.Interaction):
+    await open_shop(interaction)
+
+
+@bot.tree.command(name='shop_setup',description='Опубликовать сообщение магазина MCL')
+@app_commands.guild_only()
+async def shop_setup(interaction:discord.Interaction):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(
+            'Только Owner / Tier Check.',ephemeral=True)
+    if not db.shop_items(interaction.guild_id):
+        return await interaction.response.send_message(
+            'Сначала добавь товары командой `/shop_item_set`.',ephemeral=True)
+    await interaction.channel.send(embed=shop_panel_embed(),view=ShopPanelView())
+    await interaction.response.send_message('✅ Магазин опубликован.',ephemeral=True)
+
+
+@bot.tree.command(name='shop_item_set',description='Добавить или обновить товар магазина')
+@app_commands.guild_only()
+@app_commands.describe(name='Название товара',price='Цена в баллах',
+                       description='Краткое описание награды')
+async def shop_item_set(interaction:discord.Interaction,name:str,price:int,
+                        description:str=''):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(
+            'Только Owner / Tier Check.',ephemeral=True)
+    name=name.strip()
+    description=description.strip()
+    if not 2 <= len(name) <= 100:
+        return await interaction.response.send_message(
+            'Название должно содержать 2–100 символов.',ephemeral=True)
+    if not 1 <= price <= 100000:
+        return await interaction.response.send_message(
+            'Цена должна быть от 1 до 100000 баллов.',ephemeral=True)
+    if len(description) > 200:
+        return await interaction.response.send_message(
+            'Описание не должно быть длиннее 200 символов.',ephemeral=True)
+    item=db.set_shop_item(interaction.guild_id,name,price,description)
+    await interaction.response.send_message(
+        f'✅ Товар **{item["name"]}** сохранён. Цена: **{item["price"]}**.',ephemeral=True)
+
+
+@bot.tree.command(name='shop_item_remove',description='Убрать товар из магазина')
+@app_commands.guild_only()
+@app_commands.describe(name='Точное название товара')
+async def shop_item_remove(interaction:discord.Interaction,name:str):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(
+            'Только Owner / Tier Check.',ephemeral=True)
+    if not db.deactivate_shop_item(interaction.guild_id,name.strip()):
+        return await interaction.response.send_message('Активный товар не найден.',ephemeral=True)
+    await interaction.response.send_message(f'✅ Товар **{name.strip()}** убран.',ephemeral=True)
+
+
+@bot.tree.command(name='shop_items',description='Показать текущие товары магазина')
+@app_commands.guild_only()
+async def shop_items(interaction:discord.Interaction):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(
+            'Только Owner / Tier Check.',ephemeral=True)
+    await interaction.response.send_message(embed=shop_embed(interaction.guild_id),ephemeral=True)
+
+
+@bot.tree.command(name='points_adjust',description='Добавить или снять баллы у игрока')
+@app_commands.guild_only()
+@app_commands.choices(action=[
+    app_commands.Choice(name='Добавить',value='add'),
+    app_commands.Choice(name='Снять',value='subtract'),
+])
+@app_commands.describe(member='Игрок',action='Добавить или снять',
+                       amount='Количество баллов',reason='Причина изменения')
+async def points_adjust(interaction:discord.Interaction,member:discord.Member,
+                        action:app_commands.Choice[str],amount:int,reason:str):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message(
+            'Только Owner / Tier Check.',ephemeral=True)
+    if not 1 <= amount <= 100000:
+        return await interaction.response.send_message(
+            'Количество должно быть от 1 до 100000.',ephemeral=True)
+    reason=reason.strip()
+    if not 3 <= len(reason) <= 250:
+        return await interaction.response.send_message(
+            'Причина должна содержать 3–250 символов.',ephemeral=True)
+    signed_amount=amount if action.value=='add' else -amount
+    status,actual,balance,weekly=db.adjust_points(
+        interaction.guild_id,member.id,interaction.user.id,signed_amount,reason)
+    if status!='ok':
+        messages={
+            'missing':'У игрока нет профиля MCL.',
+            'limit':'Игрок уже достиг недельного лимита 160.',
+            'insufficient':f'Нельзя снять больше баланса. Текущий баланс: **{balance}**.',
+            'invalid':'Некорректное количество баллов.',
+        }
+        return await interaction.response.send_message(messages[status],ephemeral=True)
+    sign='+' if actual>0 else ''
+    limited=(actual != signed_amount)
+    record=db.player(interaction.guild_id,member.id)
+    channel=interaction.guild.get_channel(record['personal_channel_id']) if record else None
+    if isinstance(channel,discord.TextChannel):
+        notification=discord.Embed(
+            title='MCL | Изменение баланса',
+            description=(f'Игрок: {member.mention}\n'
+                         f'Изменение: **{sign}{actual}**\n'
+                         f'Причина: **{reason}**\n'
+                         f'Новый баланс: **{balance}**\n'
+                         f'Изменил: {interaction.user.mention}'),
+            color=discord.Color.green() if actual>0 else discord.Color.red())
+        try:
+            await channel.send(embed=notification)
+        except discord.HTTPException:
+            logging.exception('Could not send balance adjustment notification')
+    await interaction.response.send_message(
+        f'✅ {member.mention}: **{sign}{actual}** баллов. '
+        f'Баланс: **{balance}**, за неделю: **{weekly}/{db.LIMIT}**.'+
+        (' Сумма уменьшена из-за недельного лимита.' if limited else ''),ephemeral=True)
+
+
 @bot.tree.command(name='leaderboard',description='Топ игроков MCL по баллам за неделю')
 @app_commands.guild_only()
 async def leaderboard(interaction:discord.Interaction):
-    with db.connect() as conn:
-        rows=conn.execute('''SELECT p.user_id,p.nickname,COALESCE(SUM(a.points),0) AS score
-            FROM players p LEFT JOIN awards a ON a.guild_id=p.guild_id AND a.user_id=p.user_id AND a.week_key=?
-            WHERE p.guild_id=? GROUP BY p.user_id,p.nickname ORDER BY score DESC,p.nickname ASC LIMIT 10''',
-            (db.week_key(),interaction.guild_id)).fetchall()
+    rows=db.weekly_leaderboard(interaction.guild_id)
     lines=[f'**{i}.** {r["nickname"]}: **{r["score"]}**' for i,r in enumerate(rows,1)]
     em=discord.Embed(title='🏆 MCL | Топ недели',description='\n'.join(lines) if lines else 'Пока нет игроков.',color=discord.Color.gold())
     await interaction.response.send_message(embed=em)

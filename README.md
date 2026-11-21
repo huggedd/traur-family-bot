@@ -1,6 +1,14 @@
-# TRAUR / MCL Bot v0.3 — Railway SQLite Volume
+# TRAUR / MCL Bot v0.4 — Points Shop
 
 Same logic as v0.2: player registration, persistent private archive channel per player, upload screenshots/videos/links for point requests, owner/tier-check approval, 160 weekly limit, lifetime points, leaderboard.
+
+## Shop and balance management
+- Owner / Tier Check can use `/points_adjust` to add or subtract points from a registered player. Positive adjustments respect the 160-point weekly limit; deductions never make the balance negative. Every change is written to an audit ledger and announced in the player's private channel.
+- Configure up to 25 active shop items with `/shop_item_set`; remove an item with `/shop_item_remove`; review the catalog with `/shop_items`.
+- Publish the public shop message with `/shop_setup`. Players can also use `/shop` or the **Магазин** button in the main panel.
+- Selecting a product creates a pending request in the player's private channel. Points are deducted atomically only when Owner / Tier Check presses **Одобрить покупку**. Rejected or unaffordable purchases do not change the balance.
+- Player profiles show weekly earned points, current spendable balance, and lifetime earned points. Purchases and manual deductions do not reduce the weekly-earned counter.
+- Shop items are intentionally stored in SQLite instead of source code, so the real catalog and prices can be entered from Discord without another deployment.
 
 ## Railway deployment
 1. In Railway, stop the service before database migration if there is any live data. Never run this bot from your PC and Railway at the same time.
