@@ -25,6 +25,13 @@ def is_staff(member):
                 for role in member.roles))
 
 
+def is_owner(member):
+    if not isinstance(member,discord.Member):
+        return False
+    return (member.guild_permissions.administrator or
+            any(role.id==OWNER_ROLE_ID and role.id!=0 for role in member.roles))
+
+
 def profile_embed(member, record):
     balance, weekly, earned = db.point_summary(member.guild.id, member.id)
     em = discord.Embed(title='MCL | Профиль игрока', color=discord.Color.gold())
@@ -136,6 +143,72 @@ class ActivityModal(discord.ui.Modal,title='MCL | Заявка на баллы')
             ephemeral=True)
 
 
+class UnlimitedGrantModal(discord.ui.Modal,title='MCL | Выдать баллы без лимита'):
+    amount=discord.ui.TextInput(label='Количество баллов',placeholder='Например: 500',
+                                min_length=1,max_length=7)
+    reason=discord.ui.TextInput(label='Причина',style=discord.TextStyle.paragraph,
+                                placeholder='Старые баллы, приз, компенсация...',
+                                min_length=3,max_length=250)
+
+    def __init__(self,member_id,member_label):
+        super().__init__()
+        self.member_id=member_id
+        self.member_label=member_label
+
+    async def on_submit(self,interaction:discord.Interaction):
+        if not is_owner(interaction.user):
+            return await interaction.response.send_message('Только Owner / администратор.',ephemeral=True)
+        try:
+            amount=int(str(self.amount).strip())
+        except ValueError:
+            return await interaction.response.send_message('Введи целое число.',ephemeral=True)
+        reason=str(self.reason).strip()
+        status,balance,weekly=db.grant_points_unlimited(
+            interaction.guild_id,self.member_id,interaction.user.id,amount,reason)
+        if status!='ok':
+            message='У игрока нет профиля MCL.' if status=='missing' else 'Введите число от 1 до 1 000 000.'
+            return await interaction.response.send_message(message,ephemeral=True)
+        record=db.player(interaction.guild_id,self.member_id)
+        channel=interaction.guild.get_channel(record['personal_channel_id']) if record else None
+        if isinstance(channel,discord.TextChannel):
+            notification=discord.Embed(
+                title='MCL | Админ-начисление',
+                description=(f'Игрок: <@{self.member_id}>\n'
+                             f'Начислено: **+{amount}**\n'
+                             f'Причина: **{reason}**\n'
+                             f'Новый баланс: **{balance}**\n'
+                             f'Выдал: {interaction.user.mention}'),
+                color=discord.Color.green())
+            try:
+                await channel.send(embed=notification)
+            except discord.HTTPException:
+                logging.exception('Could not send owner grant notification')
+        await interaction.response.send_message(
+            f'✅ {self.member_label}: **+{amount}**. Баланс: **{balance}**. '
+            f'Недельный счётчик не изменён: **{weekly}/{db.LIMIT}**.',ephemeral=True)
+
+
+class AdminUserSelect(discord.ui.UserSelect):
+    def __init__(self):
+        super().__init__(placeholder='Выбери зарегистрированного игрока…',min_values=1,max_values=1)
+
+    async def callback(self,interaction:discord.Interaction):
+        if not is_owner(interaction.user):
+            return await interaction.response.send_message('Только Owner / администратор.',ephemeral=True)
+        member=self.values[0]
+        if member.bot:
+            return await interaction.response.send_message('Боту нельзя начислять баллы.',ephemeral=True)
+        if not db.player(interaction.guild_id,member.id):
+            return await interaction.response.send_message('У этого пользователя нет профиля MCL.',ephemeral=True)
+        await interaction.response.send_modal(UnlimitedGrantModal(member.id,member.display_name))
+
+
+class AdminMemberSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.add_item(AdminUserSelect())
+
+
 class PanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -166,6 +239,15 @@ class PanelView(discord.ui.View):
     @discord.ui.button(label='Магазин',style=discord.ButtonStyle.primary,custom_id='mcl:shop:panel')
     async def shop(self,interaction:discord.Interaction,button:discord.ui.Button):
         await open_shop(interaction)
+
+    @discord.ui.button(label='Админ: выдать баллы',style=discord.ButtonStyle.danger,
+                       custom_id='mcl:admin:grant',row=1)
+    async def admin_grant(self,interaction:discord.Interaction,button:discord.ui.Button):
+        if not is_owner(interaction.user):
+            return await interaction.response.send_message('Только Owner / администратор.',ephemeral=True)
+        await interaction.response.send_message(
+            'Выбери игрока. Начисление увеличит баланс без недельного лимита.',
+            view=AdminMemberSelectView(),ephemeral=True)
 
 
 async def open_shop(interaction):
@@ -585,6 +667,17 @@ async def points_adjust(interaction:discord.Interaction,member:discord.Member,
         f'✅ {member.mention}: **{sign}{actual}** баллов. '
         f'Баланс: **{balance}**, за неделю: **{weekly}/{db.LIMIT}**.'+
         (' Сумма уменьшена из-за недельного лимита.' if limited else ''),ephemeral=True)
+
+
+@bot.tree.command(name='admin_grant',description='Owner: выдать баллы без недельного лимита')
+@app_commands.guild_only()
+async def admin_grant(interaction:discord.Interaction):
+    if not is_owner(interaction.user):
+        return await interaction.response.send_message(
+            'Только Owner / администратор.',ephemeral=True)
+    await interaction.response.send_message(
+        'Выбери игрока. Начисление увеличит баланс и не изменит недельный счётчик.',
+        view=AdminMemberSelectView(),ephemeral=True)
 
 
 @bot.tree.command(name='leaderboard',description='Топ игроков MCL по баллам за неделю')

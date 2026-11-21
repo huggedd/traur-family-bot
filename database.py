@@ -362,6 +362,29 @@ def adjust_points(guild_id, user_id, reviewer_id, amount, reason):
         conn.close()
 
 
+def grant_points_unlimited(guild_id, user_id, reviewer_id, amount, reason):
+    """Owner-only grant that increases balance without affecting the weekly cap."""
+    if amount <= 0 or amount > 1000000:
+        return 'invalid', 0, 0
+    conn = connect()
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        if conn.execute('SELECT 1 FROM players WHERE guild_id=? AND user_id=?',
+                        (guild_id,user_id)).fetchone() is None:
+            conn.rollback()
+            return 'missing', 0, 0
+        balance, weekly, _ = _point_summary(conn,guild_id,user_id)
+        conn.execute('''INSERT INTO point_transactions(
+            guild_id,user_id,amount,kind,description,reviewer_id,week_key)
+            VALUES(?,?,?,?,?,?,NULL)''',(
+                guild_id,user_id,amount,'owner_grant',reason,reviewer_id,
+            ))
+        conn.commit()
+        return 'ok', balance+amount, weekly
+    finally:
+        conn.close()
+
+
 def set_shop_item(guild_id, name, price, description):
     with connect() as conn:
         conn.execute('''INSERT INTO shop_items(guild_id,name,description,price,active)
