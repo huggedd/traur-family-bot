@@ -5,22 +5,83 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # Railway volumes are mounted outside the deploy directory.
-# In Railway use RAILWAY_VOLUME_MOUNT_PATH=/data (managed by Railway).
-# Locally the DB stays next to database.py.
+# In Railway RAILWAY_VOLUME_MOUNT_PATH is provided automatically for the
+# attached Volume. Locally the DB stays next to database.py.
+APP_DIR = Path(__file__).resolve().parent
+LEGACY_DB_PATH = APP_DIR / 'mcl.sqlite3'
 volume_path = os.getenv('RAILWAY_VOLUME_MOUNT_PATH')
 explicit_db_path = os.getenv('MCL_DB_PATH')
-if os.getenv('RAILWAY_ENVIRONMENT_NAME') and not (volume_path or explicit_db_path):
+is_railway = any(os.getenv(name) for name in (
+    'RAILWAY_ENVIRONMENT_ID',
+    'RAILWAY_ENVIRONMENT_NAME',
+    'RAILWAY_PROJECT_ID',
+))
+if is_railway and not (volume_path or explicit_db_path):
     raise RuntimeError(
         'Railway Volume not found. Attach a Volume to this service before starting. '
         'Do not store SQLite in the temporary deployment filesystem.'
     )
-DB_PATH = str(
-    Path(explicit_db_path) if explicit_db_path else
-    (Path(volume_path) / 'mcl.sqlite3' if volume_path else
-     Path(__file__).resolve().parent / 'mcl.sqlite3')
-)
+
+if explicit_db_path:
+    selected_db_path = Path(explicit_db_path).expanduser()
+    if not selected_db_path.is_absolute():
+        selected_db_path = APP_DIR / selected_db_path
+elif volume_path:
+    selected_db_path = Path(volume_path) / 'mcl.sqlite3'
+else:
+    selected_db_path = LEGACY_DB_PATH
+
+DB_PATH = str(selected_db_path.resolve())
 TZ = ZoneInfo('Europe/Zagreb')
 LIMIT = 160
+_database_prepared = False
+
+
+class ClosingConnection(sqlite3.Connection):
+    """Commit/rollback like sqlite3.Connection and always close afterward."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
+def prepare_database():
+    """Create the DB directory and safely copy a legacy DB on first use.
+
+    SQLite's backup API includes committed WAL data. The legacy source is never
+    deleted or modified, and an existing destination is never overwritten.
+    """
+    global _database_prepared
+    if _database_prepared:
+        return
+
+    destination = Path(DB_PATH)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination != LEGACY_DB_PATH and not destination.exists() and LEGACY_DB_PATH.exists():
+        temporary = destination.with_name(f'.{destination.name}.{os.getpid()}.migrating')
+        source_uri = f'{LEGACY_DB_PATH.resolve().as_uri()}?mode=ro'
+        try:
+            source = sqlite3.connect(source_uri, uri=True)
+            target = sqlite3.connect(temporary)
+            try:
+                source.backup(target)
+                check = target.execute('PRAGMA quick_check').fetchone()[0]
+                if check != 'ok':
+                    raise sqlite3.DatabaseError(f'backup integrity check failed: {check}')
+            finally:
+                target.close()
+                source.close()
+            if destination.exists():
+                temporary.unlink(missing_ok=True)
+            else:
+                temporary.replace(destination)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    _database_prepared = True
 
 
 def week_key():
@@ -30,7 +91,8 @@ def week_key():
 
 
 def connect():
-    conn = sqlite3.connect(DB_PATH, timeout=20)
+    prepare_database()
+    conn = sqlite3.connect(DB_PATH, timeout=20, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA busy_timeout=20000')
     conn.execute('PRAGMA foreign_keys=ON')
