@@ -1,9 +1,11 @@
+import asyncio
 import os
 import re
 import logging
+import sqlite3
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import database as db
 
@@ -298,6 +300,95 @@ class BulkGrantModal(discord.ui.Modal,title='MCL | Выдать баллы вс�
             view=BulkGrantConfirmView(interaction.user.id,amount,reason),ephemeral=True)
 
 
+class AbsenceModal(discord.ui.Modal):
+    reason = discord.ui.TextInput(
+        label='Причина отсутствия', style=discord.TextStyle.paragraph, max_length=500,
+    )
+
+    def __init__(self, kind):
+        title, maximum, _ = db.ABSENCE_RULES[kind]
+        super().__init__(title=title)
+        self.kind = kind
+        self.hours = discord.ui.TextInput(
+            label=f'Длительность в часах (1–{maximum})', max_length=3,
+        )
+        self.add_item(self.hours)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        raw_hours = self.hours.value.strip()
+        if not raw_hours.isascii() or not raw_hours.isdecimal():
+            return await interaction.followup.send('Введи целое число часов.', ephemeral=True)
+        try:
+            ends_at = await asyncio.to_thread(
+                db.create_absence, interaction.guild_id, interaction.user.id,
+                self.kind, self.reason.value, int(raw_hours),
+            )
+        except ValueError as error:
+            return await interaction.followup.send(str(error), ephemeral=True)
+        await interaction.followup.send(
+            f'Отсутствие оформлено до <t:{ends_at}:F>.', ephemeral=True,
+        )
+
+
+async def open_absence(interaction, kind):
+    if not interaction.guild_id or not db.player(interaction.guild_id, interaction.user.id):
+        return await interaction.response.send_message('Сначала зарегистрируйся.', ephemeral=True)
+    await interaction.response.send_modal(AbsenceModal(kind))
+
+
+def absence_embed(record):
+    label = db.ABSENCE_RULES[record['kind']][0]
+    embed = discord.Embed(title=f"{label} · №{record['id']}")
+    player = discord.utils.escape_mentions(discord.utils.escape_markdown(record['nickname']))
+    embed.add_field(name='Игрок', value=f"{player} (<@{record['user_id']}>)", inline=False)
+    embed.add_field(name='Причина', value=record['reason'], inline=False)
+    embed.add_field(name='Начало', value=f"<t:{record['starts_at']}:F>")
+    embed.add_field(name='Окончание', value=f"<t:{record['ends_at']}:F>")
+    hours = (record['ends_at'] - record['starts_at']) // 3600
+    embed.add_field(name='Длительность', value=f'{hours} ч.')
+    previous = record['previous_started_at']
+    embed.add_field(
+        name='Начало предыдущего отсутствия',
+        value=f'<t:{previous}:F>' if previous is not None else 'Нет записей',
+        inline=False,
+    )
+    return embed
+
+
+async def absence_log_channel(guild):
+    log_name = 'журнал-отсутствий'
+    log_topic = 'TraurBot: журнал отсутствий'
+    channels = await guild.fetch_channels()
+    matches = [channel for channel in channels
+               if isinstance(channel, discord.TextChannel)
+               and channel.name == log_name]
+    reviewer = guild.get_role(REVIEWER_ROLE_ID)
+    owner = guild.get_role(OWNER_ROLE_ID)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, embed_links=True, read_message_history=True,
+        ),
+    }
+    for role in (reviewer, owner):
+        if role is not None and role != guild.default_role:
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True, read_message_history=True, send_messages=False,
+            )
+    if not matches:
+        channel = await guild.create_text_channel(
+            log_name, topic=log_topic, overwrites=overwrites, reason='Журнал отсутствий TraurBot',
+        )
+        if channel.overwrites == overwrites:
+            return channel
+    elif len(matches) == 1:
+        channel = matches[0]
+        if channel.topic == log_topic and channel.overwrites == overwrites:
+            return channel
+    raise RuntimeError(f'Не удалось проверить приватность журнала на сервере {guild.id}')
+
+
 class PanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -328,6 +419,16 @@ class PanelView(discord.ui.View):
     @discord.ui.button(label='Магазин',style=discord.ButtonStyle.primary,custom_id='mcl:shop:panel')
     async def shop(self,interaction:discord.Interaction,button:discord.ui.Button):
         await open_shop(interaction)
+
+    @discord.ui.button(label='Взять выходной', style=discord.ButtonStyle.secondary,
+                       custom_id='mcl:absence:day_off', row=2)
+    async def day_off(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await open_absence(interaction, 'day_off')
+
+    @discord.ui.button(label='Взять отпуск', style=discord.ButtonStyle.secondary,
+                       custom_id='mcl:absence:vacation', row=2)
+    async def vacation(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await open_absence(interaction, 'vacation')
 
     @discord.ui.button(label='Админ: выдать баллы',style=discord.ButtonStyle.danger,
                        custom_id='mcl:admin:grant',row=1)
@@ -604,6 +705,8 @@ class MCLBot(commands.Bot):
         db.init_db()
         db.init_v2()
         db.init_v3()
+        db.init_absences()
+        logging.info("SQLite absence migration ready")
         self.add_view(PanelView())
         self.add_view(ShopPanelView())
         for s in db.pending_submissions():
@@ -623,7 +726,8 @@ bot=MCLBot()
 @bot.tree.command(name='setup',description='Опубликовать панель управления MCL')
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
-async def setup(interaction:discord.Interaction):
+@app_commands.describe(message_id='ID существующей панели в этом канале для обновления')
+async def setup(interaction:discord.Interaction, message_id: str | None = None):
     if not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message('Команда только для администраторов.',ephemeral=True)
     em=discord.Embed(title='🏆 MCL | FAMILY POINTS',
@@ -631,10 +735,54 @@ async def setup(interaction:discord.Interaction):
                      '**Мой профиль:** проверь баланс и баллы.\n'
                      '**Подать на баллы:** приложи скриншот/видео в личном канале.\n'
                      '**Магазин:** выбери награду и отправь запрос на покупку.\n\n'
+                     '**Взять выходной / отпуск:** оформи отсутствие с текущего момента.\n\n'
                      '**Лимит: 160 баллов за неделю.**'),
         color=discord.Color.gold())
+    if message_id is not None:
+        if not re.fullmatch(r'[0-9]{1,20}', message_id) or not 0 < int(message_id) < 2**64:
+            return await interaction.response.send_message('Неверный ID сообщения.', ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            message = await interaction.channel.fetch_message(int(message_id))
+        except (discord.NotFound, discord.Forbidden):
+            return await interaction.followup.send('Панель в этом канале не найдена.', ephemeral=True)
+        if (message.author != bot.user or not message.embeds
+                or message.embeds[0].title != em.title):
+            return await interaction.followup.send('Это сообщение не является главной панелью.', ephemeral=True)
+        await message.edit(embed=em, view=PanelView())
+        return await interaction.followup.send('✅ Панель обновлена.', ephemeral=True)
     await interaction.channel.send(embed=em,view=PanelView())
     await interaction.response.send_message('✅ Панель опубликована.',ephemeral=True)
+
+
+@bot.tree.command(name='absence_history', description='Посмотреть свою историю отсутствий')
+@app_commands.guild_only()
+async def absence_history(interaction: discord.Interaction,
+                          page: app_commands.Range[int, 1, 1000000] = 1):
+    await show_absence_history(interaction, interaction.user.id, page)
+
+
+@bot.tree.command(name='staff_absence_history', description='Посмотреть историю отсутствий игрока')
+@app_commands.guild_only()
+async def staff_absence_history(interaction: discord.Interaction, user_id: str,
+                                page: app_commands.Range[int, 1, 1000000] = 1):
+    if not is_staff(interaction.user):
+        return await interaction.response.send_message('Команда для старшего состава.', ephemeral=True)
+    if not re.fullmatch(r'[0-9]{1,19}', user_id) or not 0 < int(user_id) < 2**63:
+        return await interaction.response.send_message('Введи Discord ID игрока.', ephemeral=True)
+    await show_absence_history(interaction, int(user_id), page)
+
+
+async def show_absence_history(interaction, user_id, page):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    records = await asyncio.to_thread(db.absence_history, interaction.guild_id, user_id, page)
+    if not records:
+        return await interaction.followup.send('На этой странице нет записей.', ephemeral=True)
+    next_page = f'Следующая страница — {page + 1}.' if len(records) > 5 else None
+    await interaction.followup.send(
+        content=next_page, embeds=[absence_embed(record) for record in records[:5]],
+        ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 @bot.tree.command(name='profile',description='Посмотреть профиль MCL')
@@ -828,9 +976,30 @@ async def on_message(message:discord.Message):
     await message.add_reaction('📨')
 
 
+@tasks.loop(seconds=30)
+async def publish_absence_logs():
+    for guild in bot.guilds:
+        if (GUILD_ID and guild.id != GUILD_ID) or guild.unavailable:
+            continue
+        try:
+            records = await asyncio.to_thread(db.pending_absence_logs, guild.id)
+            if not records:
+                continue
+            channel = await absence_log_channel(guild)
+            for record in records:
+                message = await channel.send(
+                    embed=absence_embed(record), allowed_mentions=discord.AllowedMentions.none(),
+                )
+                await asyncio.to_thread(db.mark_absence_logged, record['id'], message.id)
+        except (discord.HTTPException, RuntimeError, sqlite3.Error):
+            logging.exception('Could not publish absence log for guild %s', guild.id)
+
+
 @bot.event
 async def on_ready():
     logging.info('MCL bot online: %s',bot.user)
+    if not publish_absence_logs.is_running():
+        publish_absence_logs.start()
 
 if __name__=='__main__':
     if not TOKEN:

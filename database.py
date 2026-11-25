@@ -579,3 +579,96 @@ def create_activity_submission(guild_id,user_id,evidence,activity):
         cur=conn.execute('INSERT INTO submissions(guild_id,user_id,evidence,activity) VALUES(?,?,?,?)',
                          (guild_id,user_id,evidence,activity))
         return cur.lastrowid
+
+
+ABSENCE_RULES = {
+    'day_off': ('Выходной', 48, 7),
+    'vacation': ('Отпуск', 168, 30),
+}
+
+
+def init_absences():
+    with connect() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS absences (
+            id INTEGER PRIMARY KEY,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            nickname TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('day_off', 'vacation')),
+            reason TEXT NOT NULL CHECK(length(trim(reason)) BETWEEN 1 AND 500),
+            starts_at INTEGER NOT NULL,
+            ends_at INTEGER NOT NULL,
+            previous_started_at INTEGER,
+            log_message_id INTEGER,
+            CHECK(ends_at - starts_at BETWEEN 3600 AND
+                  CASE kind WHEN 'day_off' THEN 172800 ELSE 604800 END),
+            FOREIGN KEY(guild_id, user_id) REFERENCES players(guild_id, user_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_absences_player
+            ON absences(guild_id, user_id, starts_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_absences_pending_log
+            ON absences(guild_id, id) WHERE log_message_id IS NULL;
+        """)
+
+
+def create_absence(guild_id, user_id, kind, reason, hours):
+    _, maximum, cooldown_days = ABSENCE_RULES[kind]
+    reason = reason.strip()
+    if not 1 <= len(reason) <= 500 or type(hours) is not int or not 1 <= hours <= maximum:
+        raise ValueError(f'Введи причину и длительность от 1 до {maximum} часов.')
+
+    with connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        starts_at = int(conn.execute("SELECT strftime('%s', 'now')").fetchone()[0])
+        ends_at = starts_at + hours * 3600
+        params = (guild_id, user_id)
+        profile = conn.execute(
+            'SELECT nickname FROM players WHERE guild_id=? AND user_id=?', params,
+        ).fetchone()
+        if profile is None:
+            raise ValueError('Сначала зарегистрируйся.')
+        overlap = conn.execute("""
+            SELECT ends_at FROM absences
+            WHERE guild_id=? AND user_id=? AND starts_at<? AND ends_at>?
+            ORDER BY ends_at DESC LIMIT 1
+        """, (*params, ends_at, starts_at)).fetchone()
+        if overlap:
+            raise ValueError(f'Текущее отсутствие закончится <t:{overlap["ends_at"]}:R>.')
+        last_of_kind = conn.execute("""
+            SELECT MAX(starts_at) FROM absences WHERE guild_id=? AND user_id=? AND kind=?
+        """, (*params, kind)).fetchone()[0]
+        if last_of_kind is not None:
+            eligible_at = last_of_kind + cooldown_days * 86400
+            if eligible_at > starts_at:
+                raise ValueError(f'Этот тип отсутствия снова доступен <t:{eligible_at}:F>.')
+        previous_started_at = conn.execute("""
+            SELECT MAX(starts_at) FROM absences WHERE guild_id=? AND user_id=?
+        """, params).fetchone()[0]
+        conn.execute("""
+            INSERT INTO absences
+                (guild_id, user_id, nickname, kind, reason, starts_at, ends_at, previous_started_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (*params, profile['nickname'], kind, reason, starts_at, ends_at, previous_started_at))
+        return ends_at
+
+
+def absence_history(guild_id, user_id, page):
+    with connect() as conn:
+        return conn.execute("""
+            SELECT * FROM absences WHERE guild_id=? AND user_id=?
+            ORDER BY starts_at DESC, id DESC LIMIT 6 OFFSET ?
+        """, (guild_id, user_id, (page - 1) * 5)).fetchall()
+
+
+def pending_absence_logs(guild_id):
+    with connect() as conn:
+        return conn.execute("""
+            SELECT * FROM absences WHERE guild_id=? AND log_message_id IS NULL
+            ORDER BY id LIMIT 25
+        """, (guild_id,)).fetchall()
+
+
+def mark_absence_logged(absence_id, message_id):
+    with connect() as conn:
+        conn.execute('UPDATE absences SET log_message_id=? WHERE id=?', (message_id, absence_id))
